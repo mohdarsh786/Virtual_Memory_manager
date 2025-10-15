@@ -14,8 +14,11 @@ int total_frames = 0;
 
 int page_frame[1024];
 int page_valid[1024];
+int page_on_disk[1024];
 
 int frame_occupied[256];
+char* physical_memory[256];
+int frame_to_page[256];
 
 int fifo_queue[256];
 int fifo_front = 0;
@@ -23,6 +26,10 @@ int fifo_rear = 0;
 
 int page_faults = 0;
 int swaps = 0;
+
+double total_fault_time = 0.0;
+double total_swap_out_time = 0.0;
+double total_swap_in_time = 0.0;
 
 FILE* disk_store = NULL;
 
@@ -35,21 +42,43 @@ struct program_info {
     double linux_time;
     double avg_access_time;
     int total_accesses;
+    double avg_fault_time;
+    double avg_swap_out_time;
+    double avg_swap_in_time;
+    double total_io_time;
 };
+
+double get_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
 
 void init_memory(void) {
     int i;
     for (i = 0; i < 1024; i++) {
         page_frame[i] = -1;
         page_valid[i] = 0;
+        page_on_disk[i] = 0;
     }
     for (i = 0; i < 256; i++) {
         frame_occupied[i] = 0;
+        frame_to_page[i] = -1;
+        if (physical_memory[i]) {
+            free(physical_memory[i]);
+        }
+        physical_memory[i] = malloc(page_size_kb * 1024);
+        if (physical_memory[i]) {
+            memset(physical_memory[i], 0, page_size_kb * 1024);
+        }
     }
     fifo_front = 0;
     fifo_rear = 0;
     page_faults = 0;
     swaps = 0;
+    total_fault_time = 0.0;
+    total_swap_out_time = 0.0;
+    total_swap_in_time = 0.0;
     
     if (!disk_store) {
         disk_store = fopen("disk_swap.bin", "w+b");
@@ -78,14 +107,35 @@ int find_free_frame(void) {
 }
 
 void swap_to_disk(int page) {
+    int frame = page_frame[page];
+    if (frame < 0 || !physical_memory[frame]) return;
+    
+    double start = get_time_ms();
     long pos = (long)page * page_size_kb * 1024;
     fseek(disk_store, pos, SEEK_SET);
-    fwrite(&page, sizeof(int), 1, disk_store);
+    fwrite(physical_memory[frame], page_size_kb * 1024, 1, disk_store);
     fflush(disk_store);
+    double end = get_time_ms();
+    
+    page_on_disk[page] = 1;
     swaps++;
+    total_swap_out_time += (end - start);
+}
+
+void read_from_disk(int page, int frame) {
+    if (!page_on_disk[page] || !physical_memory[frame]) return;
+    
+    double start = get_time_ms();
+    long pos = (long)page * page_size_kb * 1024;
+    fseek(disk_store, pos, SEEK_SET);
+    fread(physical_memory[frame], page_size_kb * 1024, 1, disk_store);
+    double end = get_time_ms();
+    
+    total_swap_in_time += (end - start);
 }
 
 void handle_page_fault(int page) {
+    double fault_start = get_time_ms();
     int frame = find_free_frame();
     
     if (frame == -1) {
@@ -94,25 +144,38 @@ void handle_page_fault(int page) {
         swap_to_disk(victim);
         page_valid[victim] = 0;
         page_frame[victim] = -1;
+        frame_to_page[frame] = -1;
+    }
+    
+    if (page_on_disk[page]) {
+        read_from_disk(page, frame);
+    } else {
+        if (physical_memory[frame]) {
+            memset(physical_memory[frame], page, page_size_kb * 1024);
+        }
     }
     
     page_frame[page] = frame;
     page_valid[page] = 1;
     frame_occupied[frame] = 1;
+    frame_to_page[frame] = page;
     enqueue(page);
+    
+    double fault_end = get_time_ms();
+    total_fault_time += (fault_end - fault_start);
 }
 
 void access_page(int page) {
     if (page_valid[page] == 0) {
         page_faults++;
         handle_page_fault(page);
+    } else {
+        int frame = page_frame[page];
+        if (physical_memory[frame]) {
+            volatile char data = physical_memory[frame][0];
+            physical_memory[frame][0] = data;
+        }
     }
-}
-
-double get_time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
 long get_memory_kb(void) {
@@ -201,6 +264,10 @@ void run_with_fifo(char* name, long memory_kb, struct program_info* info) {
     info->faults = page_faults;
     info->swaps = swaps;
     info->avg_access_time = info->faults > 0 ? (info->fifo_time / info->total_accesses) : 0.0;
+    info->avg_fault_time = info->faults > 0 ? (total_fault_time / info->faults) : 0.0;
+    info->avg_swap_out_time = info->swaps > 0 ? (total_swap_out_time / info->swaps) : 0.0;
+    info->avg_swap_in_time = page_on_disk[0] ? (total_swap_in_time / info->faults) : 0.0;
+    info->total_io_time = total_swap_out_time + total_swap_in_time;
 }
 
 void print_results(struct program_info programs[], int count) {
@@ -209,42 +276,73 @@ void print_results(struct program_info programs[], int count) {
     double avg_linux = 0;
     int total_faults = 0;
     int total_swaps = 0;
+    double total_io = 0.0;
     
     printf("\n");
     printf("  FIFO vs Linux Performance Comparison\n");
     printf("\n");
-    printf("Program                  Memory   Accesses  Faults  Swaps  Avg Access   FIFO Time  Linux Time\n");
-    printf("---------------------------------------------------------------------------------------------------\n");
+    printf("Program                  Memory   Faults  Swaps  Avg Fault  Swap Out   Swap In    Total I/O   FIFO Time\n");
+    printf("---------------------------------------------------------------------------------------------------------------\n");
     
     for (i = 0; i < count; i++) {
-        printf("%-23s %6ld KB  %7d  %6d  %5d  %7.4f ms  %8.2f ms  %7.2f ms\n",
+        printf("%-23s %6ld KB  %6d  %5d  %8.4f ms %8.4f ms %8.4f ms %9.2f ms %9.2f ms\n",
                programs[i].name,
                programs[i].memory_kb,
-               programs[i].total_accesses,
                programs[i].faults,
                programs[i].swaps,
-               programs[i].avg_access_time,
-               programs[i].fifo_time,
-               programs[i].linux_time);
+               programs[i].avg_fault_time,
+               programs[i].avg_swap_out_time,
+               programs[i].avg_swap_in_time,
+               programs[i].total_io_time,
+               programs[i].fifo_time);
         
         avg_fifo += programs[i].fifo_time;
         avg_linux += programs[i].linux_time;
         total_faults += programs[i].faults;
         total_swaps += programs[i].swaps;
+        total_io += programs[i].total_io_time;
     }
     
-    printf("---------------------------------------------------------------------------------------------------\n");
+    printf("---------------------------------------------------------------------------------------------------------------\n");
     printf("\nSummary:\n");
     printf("  Average FIFO Time:   %.2f ms\n", avg_fifo / count);
     printf("  Average Linux Time:  %.2f ms\n", avg_linux / count);
     printf("  Total Page Faults:   %d\n", total_faults);
     printf("  Total Swaps to Disk: %d\n", total_swaps);
+    printf("  Total I/O Time:      %.2f ms\n", total_io);
+    printf("  Avg Fault Latency:   %.4f ms\n", total_faults > 0 ? (total_io / total_faults) : 0.0);
     printf("  FIFO Overhead:       %.2f%%\n", 
            avg_linux > 0 ? ((avg_fifo - avg_linux) / avg_linux * 100.0) : 0.0);
     printf("\nConfig: %d KB memory, %d KB pages, %d frames, FIFO replacement\n", 
            mem_size_kb, page_size_kb, total_frames);
 }
 
+void print_memory_map(void) {
+    int i, occupied = 0, on_disk = 0;
+    
+    printf("\n  Memory Map Snapshot\n");
+    printf("  ===================\n");
+    printf("  Frame | Page | Status\n");
+    printf("  ------+------+--------\n");
+    
+    for (i = 0; i < total_frames; i++) {
+        if (frame_occupied[i]) {
+            printf("  %4d  | %4d | In Memory\n", i, frame_to_page[i]);
+            occupied++;
+        } else {
+            printf("  %4d  |  --  | Free\n", i);
+        }
+    }
+    
+    for (i = 0; i < 1024; i++) {
+        if (page_on_disk[i] && !page_valid[i]) {
+            on_disk++;
+        }
+    }
+    
+    printf("\n  Frames in use: %d / %d\n", occupied, total_frames);
+    printf("  Pages on disk: %d\n", on_disk);
+}
 
 
 void generate_html(struct program_info programs[], int count) {
@@ -254,6 +352,7 @@ void generate_html(struct program_info programs[], int count) {
     int max_faults = 0;
     double avg_fifo = 0, avg_linux = 0;
     int total_faults = 0, total_swaps = 0;
+    double total_io = 0.0;
     
     if (!f) return;
     
@@ -265,6 +364,7 @@ void generate_html(struct program_info programs[], int count) {
         avg_linux += programs[i].linux_time;
         total_faults += programs[i].faults;
         total_swaps += programs[i].swaps;
+        total_io += programs[i].total_io_time;
     }
     avg_fifo /= count;
     avg_linux /= count;
@@ -296,6 +396,12 @@ void generate_html(struct program_info programs[], int count) {
     fprintf(f, ".note strong { color: #856404; }\n");
     fprintf(f, ".comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }\n");
     fprintf(f, ".footer { text-align: center; color: white; padding: 20px; margin-top: 30px; }\n");
+    fprintf(f, ".memory-map { display: grid; grid-template-columns: repeat(auto-fill, minmax(50px, 1fr)); gap: 5px; padding: 20px; }\n");
+    fprintf(f, ".frame-box { padding: 10px; border-radius: 5px; text-align: center; font-size: 0.85em; border: 2px solid; }\n");
+    fprintf(f, ".frame-occupied { background: #4caf50; color: white; border-color: #2e7d32; }\n");
+    fprintf(f, ".frame-free { background: #e0e0e0; color: #666; border-color: #bdbdbd; }\n");
+    fprintf(f, ".disk-section { background: #fff8e1; padding: 20px; border-radius: 10px; margin-top: 10px; }\n");
+    fprintf(f, ".disk-item { display: inline-block; padding: 5px 10px; margin: 3px; background: #ff9800; color: white; border-radius: 5px; font-size: 0.85em; }\n");
     fprintf(f, "</style>\n");
     fprintf(f, "</head>\n<body>\n");
     
@@ -337,6 +443,11 @@ void generate_html(struct program_info programs[], int count) {
     fprintf(f, "<div class='stat-label'>Total Swaps</div>\n");
     fprintf(f, "<div class='stat-value'>%d</div>\n", total_swaps);
     fprintf(f, "</div>\n");
+    
+    fprintf(f, "<div class='stat-card'>\n");
+    fprintf(f, "<div class='stat-label'>Total I/O Time</div>\n");
+    fprintf(f, "<div class='stat-value'>%.2f ms</div>\n", total_io);
+    fprintf(f, "</div>\n");
     fprintf(f, "</div>\n");
     
     /* Charts Section */
@@ -357,22 +468,61 @@ void generate_html(struct program_info programs[], int count) {
     fprintf(f, "<div class='chart-container'><canvas id='accessChart'></canvas></div>\n");
     fprintf(f, "</div>\n");
     
+    fprintf(f, "<div class='chart-section'>\n");
+    fprintf(f, "<div class='chart-title'>I/O Time Breakdown</div>\n");
+    fprintf(f, "<div class='chart-container'><canvas id='ioChart'></canvas></div>\n");
+    fprintf(f, "</div>\n");
+    
+    /* Memory Map Visualization */
+    fprintf(f, "<div class='chart-section'>\n");
+    fprintf(f, "<div class='chart-title'>Physical Memory Map</div>\n");
+    fprintf(f, "<p style='margin-bottom: 15px; color: #666;'>Visual representation of frame allocation</p>\n");
+    fprintf(f, "<div class='memory-map'>\n");
+    
+    for (i = 0; i < total_frames; i++) {
+        if (frame_occupied[i]) {
+            fprintf(f, "<div class='frame-box frame-occupied' title='Frame %d: Page %d'>F%d<br>P%d</div>\n", 
+                    i, frame_to_page[i], i, frame_to_page[i]);
+        } else {
+            fprintf(f, "<div class='frame-box frame-free' title='Frame %d: Free'>F%d<br>---</div>\n", i, i);
+        }
+    }
+    
+    fprintf(f, "</div>\n");
+    
+    fprintf(f, "<div class='disk-section'>\n");
+    fprintf(f, "<strong>Pages on Disk:</strong> ");
+    int disk_count = 0;
+    for (i = 0; i < 1024; i++) {
+        if (page_on_disk[i] && !page_valid[i]) {
+            fprintf(f, "<span class='disk-item'>Page %d</span>", i);
+            disk_count++;
+            if (disk_count > 20) {
+                fprintf(f, "<span class='disk-item'>... and more</span>");
+                break;
+            }
+        }
+    }
+    if (disk_count == 0) {
+        fprintf(f, "<span style='color: #666;'>None</span>");
+    }
+    fprintf(f, "</div>\n");
+    fprintf(f, "</div>\n");
+    
     /* Detailed Table */
     fprintf(f, "<div class='chart-section'>\n");
     fprintf(f, "<div class='chart-title'>Detailed Performance Metrics</div>\n");
     fprintf(f, "<table>\n");
-    fprintf(f, "<tr><th>Program</th><th>Memory</th><th>Accesses</th><th>Faults</th><th>Swaps</th>");
-    fprintf(f, "<th>Avg Access</th><th>FIFO Time</th><th>Linux Time</th><th>Overhead</th></tr>\n");
+    fprintf(f, "<tr><th>Program</th><th>Memory</th><th>Faults</th><th>Swaps</th><th>Avg Fault</th>");
+    fprintf(f, "<th>Swap Out</th><th>Swap In</th><th>Total I/O</th><th>FIFO Time</th></tr>\n");
     
     for (i = 0; i < count; i++) {
-        double overhead = programs[i].linux_time > 0 ? 
-                         ((programs[i].fifo_time - programs[i].linux_time) / programs[i].linux_time * 100.0) : 0.0;
-        fprintf(f, "<tr><td>%s</td><td>%ld KB</td><td>%d</td><td>%d</td><td>%d</td>",
-                programs[i].name, programs[i].memory_kb, programs[i].total_accesses,
+        fprintf(f, "<tr><td>%s</td><td>%ld KB</td><td>%d</td><td>%d</td>",
+                programs[i].name, programs[i].memory_kb,
                 programs[i].faults, programs[i].swaps);
-        fprintf(f, "<td>%.4f ms</td><td>%.2f ms</td><td>%.2f ms</td><td style='color:%s;font-weight:bold;'>%.1f%%</td></tr>\n",
-                programs[i].avg_access_time, programs[i].fifo_time, programs[i].linux_time,
-                overhead > 0 ? "#d32f2f" : "#388e3c", overhead);
+        fprintf(f, "<td>%.4f ms</td><td>%.4f ms</td><td>%.4f ms</td><td style='font-weight:bold;'>%.2f ms</td><td>%.2f ms</td></tr>\n",
+                programs[i].avg_fault_time, programs[i].avg_swap_out_time, programs[i].avg_swap_in_time,
+                programs[i].total_io_time, programs[i].fifo_time);
     }
     
     fprintf(f, "</table>\n");
@@ -477,6 +627,40 @@ void generate_html(struct program_info programs[], int count) {
     fprintf(f, "  }\n");
     fprintf(f, "});\n");
     
+    /* I/O Time Chart */
+    fprintf(f, "const ioCtx = document.getElementById('ioChart').getContext('2d');\n");
+    fprintf(f, "new Chart(ioCtx, {\n");
+    fprintf(f, "  type: 'bar',\n");
+    fprintf(f, "  data: {\n");
+    fprintf(f, "    labels: labels,\n");
+    fprintf(f, "    datasets: [{\n");
+    fprintf(f, "      label: 'Swap Out Time (ms)',\n");
+    fprintf(f, "      data: [");
+    for (i = 0; i < count; i++) {
+        fprintf(f, "%.4f%s", programs[i].avg_swap_out_time * programs[i].swaps, i < count - 1 ? ", " : "");
+    }
+    fprintf(f, "],\n");
+    fprintf(f, "      backgroundColor: 'rgba(255, 99, 132, 0.7)',\n");
+    fprintf(f, "      borderColor: 'rgba(255, 99, 132, 1)',\n");
+    fprintf(f, "      borderWidth: 2\n");
+    fprintf(f, "    }, {\n");
+    fprintf(f, "      label: 'Swap In Time (ms)',\n");
+    fprintf(f, "      data: [");
+    for (i = 0; i < count; i++) {
+        fprintf(f, "%.4f%s", programs[i].avg_swap_in_time * programs[i].faults, i < count - 1 ? ", " : "");
+    }
+    fprintf(f, "],\n");
+    fprintf(f, "      backgroundColor: 'rgba(54, 162, 235, 0.7)',\n");
+    fprintf(f, "      borderColor: 'rgba(54, 162, 235, 1)',\n");
+    fprintf(f, "      borderWidth: 2\n");
+    fprintf(f, "    }]\n");
+    fprintf(f, "  },\n");
+    fprintf(f, "  options: { responsive: true, maintainAspectRatio: false,\n");
+    fprintf(f, "    scales: { y: { beginAtZero: true, title: { display: true, text: 'Time (ms)' }, stacked: false }},\n");
+    fprintf(f, "    plugins: { legend: { display: true, position: 'top' }}\n");
+    fprintf(f, "  }\n");
+    fprintf(f, "});\n");
+    
     fprintf(f, "</script>\n");
     fprintf(f, "</body>\n</html>\n");
     fclose(f);
@@ -541,7 +725,15 @@ int main(void) {
     }
     
     print_results(programs, 10);
+    print_memory_map();
     generate_html(programs, 10);
+    
+    for (i = 0; i < 256; i++) {
+        if (physical_memory[i]) {
+            free(physical_memory[i]);
+            physical_memory[i] = NULL;
+        }
+    }
     
     if (disk_store) {
         fclose(disk_store);
