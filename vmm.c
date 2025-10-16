@@ -184,15 +184,60 @@ long get_memory_kb(void) {
     return usage.ru_maxrss;
 }
 
-void simulate_fifo(long memory_kb) {
-    int num_pages = total_frames * 2;
-    int accesses = num_pages * 50;
+int generate_trace_file(char* binary, char* trace_file) {
+    char command[512];
+    snprintf(command, sizeof(command), 
+             "valgrind --tool=lackey --trace-mem=yes %s 2>&1 | grep ' L ' | head -5000 > %s",
+             binary, trace_file);
+    return system(command) == 0;
+}
+
+int* load_trace(char* trace_file, int* count) {
+    FILE* f = fopen(trace_file, "r");
+    char line[256];
+    int capacity = 10000;
+    int size = 0;
+    int* pages;
+    
+    if (!f) return NULL;
+    
+    pages = malloc(capacity * sizeof(int));
+    if (!pages) {
+        fclose(f);
+        return NULL;
+    }
+    
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long addr;
+        if (sscanf(line, " L %lx", &addr) == 1) {
+            int page = (addr / (page_size_kb * 1024)) & 1023;
+            pages[size++] = page;
+            
+            if (size >= capacity) {
+                capacity *= 2;
+                int* tmp = realloc(pages, capacity * sizeof(int));
+                if (!tmp) {
+                    free(pages);
+                    fclose(f);
+                    return NULL;
+                }
+                pages = tmp;
+            }
+        }
+    }
+    
+    fclose(f);
+    *count = size;
+    return pages;
+}
+
+void simulate_fifo(long memory_kb, int* trace, int trace_size) {
     int i, j, k;
     volatile int dummy = 0;
     double total_access_time = 0.0;
     
-    for (i = 0; i < accesses; i++) {
-        int page = rand() % num_pages;
+    for (i = 0; i < trace_size; i++) {
+        int page = trace[i];
         double access_start = get_time_ms();
         access_page(page);
         double access_end = get_time_ms();
@@ -245,20 +290,36 @@ void run_on_linux(char* program, struct program_info* info) {
     fflush(stdout);
 }
 
-void run_with_fifo(char* name, long memory_kb, struct program_info* info) {
+void run_with_fifo(char* name, long memory_kb, struct program_info* info, char* binary) {
     double start, end;
+    char trace_file[512];
+    int* trace = NULL;
+    int trace_size = 0;
     int num_pages = total_frames * 2;
     int accesses = num_pages * 50;
     
     strcpy(info->name, name);
     info->memory_kb = memory_kb;
-    info->total_accesses = accesses;
+    
+    snprintf(trace_file, sizeof(trace_file), "%s.trace", binary);
+    
+    if (generate_trace_file(binary, trace_file)) {
+        trace = load_trace(trace_file, &trace_size);
+    }
+    
+    if (trace && trace_size > 0) {
+        info->total_accesses = trace_size;
+    } else {
+        info->total_accesses = accesses;
+    }
     
     init_memory();
     
     start = get_time_ms();
-    simulate_fifo(memory_kb);
+    simulate_fifo(memory_kb, trace, trace_size);
     end = get_time_ms();
+    
+    if (trace) free(trace);
     
     info->fifo_time = end - start;
     info->faults = page_faults;
@@ -721,7 +782,7 @@ int main(void) {
         
         printf("  %s\n", name);
         run_on_linux(binary_paths[i], &programs[i]);
-        run_with_fifo(name, programs[i].memory_kb, &programs[i]);
+        run_with_fifo(name, programs[i].memory_kb, &programs[i], binary_paths[i]);
     }
     
     print_results(programs, 10);
