@@ -26,6 +26,7 @@ int fifo_rear = 0;
 
 int page_faults = 0;
 int swaps = 0;
+int swap_ins = 0;
 
 double total_fault_time = 0.0;
 double total_swap_out_time = 0.0;
@@ -76,6 +77,7 @@ void init_memory(void) {
     fifo_rear = 0;
     page_faults = 0;
     swaps = 0;
+    swap_ins = 0;
     total_fault_time = 0.0;
     total_swap_out_time = 0.0;
     total_swap_in_time = 0.0;
@@ -87,12 +89,12 @@ void init_memory(void) {
 
 void enqueue(int page) {
     fifo_queue[fifo_rear] = page;
-    fifo_rear = (fifo_rear + 1) % 256;
+    fifo_rear = (fifo_rear + 1) % total_frames;
 }
 
 int dequeue(void) {
     int page = fifo_queue[fifo_front];
-    fifo_front = (fifo_front + 1) % 256;
+    fifo_front = (fifo_front + 1) % total_frames;
     return page;
 }
 
@@ -131,6 +133,7 @@ void read_from_disk(int page, int frame) {
     fread(physical_memory[frame], page_size_kb * 1024, 1, disk_store);
     double end = get_time_ms();
     
+    swap_ins++;
     total_swap_in_time += (end - start);
 }
 
@@ -210,7 +213,8 @@ int* load_trace(char* trace_file, int* count) {
     while (fgets(line, sizeof(line), f)) {
         unsigned long addr;
         if (sscanf(line, " L %lx", &addr) == 1) {
-            int page = (addr / (page_size_kb * 1024)) & 1023;
+            unsigned long page_num = addr / (page_size_kb * 1024);
+            int page = (int)(page_num % 1024);
             pages[size++] = page;
             
             if (size >= capacity) {
@@ -231,17 +235,13 @@ int* load_trace(char* trace_file, int* count) {
     return pages;
 }
 
-void simulate_fifo(long memory_kb, int* trace, int trace_size) {
+void simulate_fifo(int* trace, int trace_size) {
     int i, j, k;
     volatile int dummy = 0;
-    double total_access_time = 0.0;
     
     for (i = 0; i < trace_size; i++) {
         int page = trace[i];
-        double access_start = get_time_ms();
         access_page(page);
-        double access_end = get_time_ms();
-        total_access_time += (access_end - access_start);
         
         for (j = 0; j < 5000; j++) {
             dummy = dummy + j;
@@ -256,11 +256,9 @@ void run_on_linux(char* program, struct program_info* info) {
     pid_t pid;
     int status;
     double start, end;
-    long mem_before, mem_after;
     struct rlimit mem_limit;
     
     fflush(stdout);
-    mem_before = get_memory_kb();
     start = get_time_ms();
     
     pid = fork();
@@ -279,10 +277,9 @@ void run_on_linux(char* program, struct program_info* info) {
     } else if (pid > 0) {
         waitpid(pid, &status, 0);
         end = get_time_ms();
-        mem_after = get_memory_kb();
         
         info->linux_time = end - start;
-        info->memory_kb = mem_after - mem_before;
+        info->memory_kb = get_memory_kb();
         if (info->memory_kb < 4) {
             info->memory_kb = 8;
         }
@@ -316,7 +313,7 @@ void run_with_fifo(char* name, long memory_kb, struct program_info* info, char* 
     init_memory();
     
     start = get_time_ms();
-    simulate_fifo(memory_kb, trace, trace_size);
+    simulate_fifo(trace, trace_size);
     end = get_time_ms();
     
     if (trace) free(trace);
@@ -324,10 +321,10 @@ void run_with_fifo(char* name, long memory_kb, struct program_info* info, char* 
     info->fifo_time = end - start;
     info->faults = page_faults;
     info->swaps = swaps;
-    info->avg_access_time = info->faults > 0 ? (info->fifo_time / info->total_accesses) : 0.0;
+    info->avg_access_time = info->total_accesses > 0 ? (info->fifo_time / info->total_accesses) : 0.0;
     info->avg_fault_time = info->faults > 0 ? (total_fault_time / info->faults) : 0.0;
     info->avg_swap_out_time = info->swaps > 0 ? (total_swap_out_time / info->swaps) : 0.0;
-    info->avg_swap_in_time = page_on_disk[0] ? (total_swap_in_time / info->faults) : 0.0;
+    info->avg_swap_in_time = swap_ins > 0 ? (total_swap_in_time / swap_ins) : 0.0;
     info->total_io_time = total_swap_out_time + total_swap_in_time;
 }
 
@@ -761,6 +758,12 @@ int main(void) {
     fclose(config);
     
     total_frames = mem_size_kb / page_size_kb;
+    
+    if (total_frames > 256) {
+        printf("Error: Configuration requires %d frames, but maximum is 256\n", total_frames);
+        printf("Please adjust config.txt (increase page_size_kb or decrease mem_size_kb)\n");
+        return 1;
+    }
     
     printf("FIFO Virtual Memory Manager\n");
     printf("============================\n");
